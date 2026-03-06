@@ -1,0 +1,291 @@
+/**
+ * pi-stack — Local AI Infrastructure Generator
+ * Docker compose templates for Ollama, n8n, Flowise, Supabase, Neo4j, and more.
+ *
+ * /stack init [preset]     → generate docker-compose.yml
+ * /stack add <service>     → add service to existing compose
+ * /stack up                → docker compose up -d
+ * /stack down              → docker compose down
+ * /stack status            → docker compose ps
+ * /stack env               → regenerate .env with crypto secrets
+ */
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { execSync } from "node:child_process";
+import { join, resolve } from "node:path";
+
+const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
+const GREEN = "\x1b[32m", RED = "\x1b[31m", CYAN = "\x1b[36m";
+
+const SERVICES: Record<string, { yaml: string; volumes: string[]; env: string[] }> = {
+  ollama: {
+    yaml: `  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes: [ollama_data:/root/.ollama]
+    runtime: nvidia
+    environment: [NVIDIA_VISIBLE_DEVICES=all]
+    restart: unless-stopped`,
+    volumes: ["ollama_data"], env: [],
+  },
+  n8n: {
+    yaml: `  n8n:
+    image: n8nio/n8n:latest
+    ports: ["5678:5678"]
+    volumes: [n8n_data:/home/node/.n8n]
+    environment:
+      - N8N_ENCRYPTION_KEY=\${N8N_ENCRYPTION_KEY}
+      - N8N_PORT=5678
+    restart: unless-stopped`,
+    volumes: ["n8n_data"], env: ["N8N_ENCRYPTION_KEY"],
+  },
+  supabase: {
+    yaml: `  supabase-db:
+    image: supabase/postgres:15.1.0.117
+    ports: ["54322:5432"]
+    volumes: [supabase_db:/var/lib/postgresql/data]
+    environment:
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      - POSTGRES_DB=postgres
+    restart: unless-stopped
+  supabase-studio:
+    image: supabase/studio:latest
+    ports: ["54321:3000"]
+    environment:
+      - SUPABASE_URL=http://supabase-kong:8000
+      - SUPABASE_ANON_KEY=\${SUPABASE_ANON_KEY}
+    restart: unless-stopped`,
+    volumes: ["supabase_db"], env: ["POSTGRES_PASSWORD", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY", "JWT_SECRET"],
+  },
+  flowise: {
+    yaml: `  flowise:
+    image: flowiseai/flowise:latest
+    ports: ["3001:3000"]
+    volumes: [flowise_data:/root/.flowise]
+    environment: [PORT=3000, LOG_LEVEL=info]
+    restart: unless-stopped`,
+    volumes: ["flowise_data"], env: [],
+  },
+  neo4j: {
+    yaml: `  neo4j:
+    image: neo4j:5-community
+    ports: ["7474:7474", "7687:7687"]
+    volumes: [neo4j_data:/data, neo4j_logs:/logs]
+    environment:
+      - NEO4J_AUTH=\${NEO4J_AUTH:-neo4j/password}
+      - NEO4J_PLUGINS=["apoc"]
+    restart: unless-stopped`,
+    volumes: ["neo4j_data", "neo4j_logs"], env: ["NEO4J_AUTH"],
+  },
+  searxng: {
+    yaml: `  searxng:
+    image: searxng/searxng:latest
+    ports: ["8080:8080"]
+    volumes: [searxng_data:/etc/searxng]
+    restart: unless-stopped`,
+    volumes: ["searxng_data"], env: [],
+  },
+  qdrant: {
+    yaml: `  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333", "6334:6334"]
+    volumes: [qdrant_storage:/qdrant/storage]
+    restart: unless-stopped`,
+    volumes: ["qdrant_storage"], env: [],
+  },
+  langfuse: {
+    yaml: `  langfuse:
+    image: langfuse/langfuse:latest
+    ports: ["3002:3000"]
+    environment:
+      - DATABASE_URL=postgresql://postgres:\${POSTGRES_PASSWORD}@postgres:5432/langfuse
+      - NEXTAUTH_SECRET=\${NEXTAUTH_SECRET}
+      - NEXTAUTH_URL=http://localhost:3002
+    depends_on: [postgres]
+    restart: unless-stopped`,
+    volumes: [], env: ["NEXTAUTH_SECRET", "POSTGRES_PASSWORD"],
+  },
+  openwebui: {
+    yaml: `  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports: ["3000:8080"]
+    volumes: [openwebui_data:/app/backend/data]
+    environment: [OLLAMA_BASE_URL=http://ollama:11434]
+    restart: unless-stopped`,
+    volumes: ["openwebui_data"], env: [],
+  },
+  postgres: {
+    yaml: `  postgres:
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    environment:
+      - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
+      - POSTGRES_USER=postgres
+    restart: unless-stopped`,
+    volumes: ["postgres_data"], env: ["POSTGRES_PASSWORD"],
+  },
+  redis: {
+    yaml: `  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes: [redis_data:/data]
+    command: redis-server --appendonly yes
+    restart: unless-stopped`,
+    volumes: ["redis_data"], env: [],
+  },
+};
+
+const PRESETS: Record<string, string[]> = {
+  minimal: ["ollama"],
+  standard: ["ollama", "n8n", "supabase"],
+  full: ["ollama", "n8n", "supabase", "flowise", "neo4j", "searxng"],
+};
+
+function secret(n = 32): string { return randomBytes(n).toString("hex"); }
+
+function generateCompose(svcs: string[]): string {
+  const lines = ["# Generated by pi-stack", 'version: "3.8"', "", "services:"];
+  for (const s of svcs) {
+    if (SERVICES[s]) lines.push(SERVICES[s].yaml, "");
+  }
+  const vols = new Set<string>();
+  svcs.forEach(s => SERVICES[s]?.volumes.forEach(v => vols.add(v)));
+  if (vols.size > 0) {
+    lines.push("volumes:");
+    for (const v of vols) lines.push(`  ${v}:`);
+  }
+  lines.push("", "networks:", "  default:", "    name: ai-stack");
+  return lines.join("\n");
+}
+
+function generateEnv(svcs: string[]): string {
+  const vars = new Set<string>();
+  svcs.forEach(s => SERVICES[s]?.env.forEach(v => vars.add(v)));
+  const lines = ["# Generated by pi-stack", ""];
+  for (const v of vars) lines.push(`${v}=${secret(16)}`);
+  return lines.join("\n");
+}
+
+export default function piStack(pi: ExtensionAPI) {
+  pi.registerCommand("stack", {
+    description: "Local AI infra. /stack [init|add|up|down|status|env]",
+    execute: async (ctx, args) => {
+      const parts = args.trim().split(/\s+/);
+      const sub = parts[0]?.toLowerCase() || "help";
+
+      switch (sub) {
+        case "init": {
+          const preset = parts[1] || "standard";
+          const svcs = PRESETS[preset];
+          if (!svcs) {
+            ctx.ui.notify(`Unknown preset: ${preset}\nAvailable: ${Object.keys(PRESETS).join(", ")}`, "error");
+            return;
+          }
+          writeFileSync("docker-compose.yml", generateCompose(svcs));
+          writeFileSync(".env.example", generateEnv(svcs));
+          ctx.ui.notify([
+            `${GREEN}✓${RST} Generated ${B}docker-compose.yml${RST} (${preset}: ${svcs.join(", ")})`,
+            `${GREEN}✓${RST} Generated ${B}.env.example${RST} with crypto secrets`,
+            "", `Next: ${CYAN}cp .env.example .env && /stack up${RST}`,
+          ].join("\n"), "info");
+          break;
+        }
+
+        case "add": {
+          const svc = parts[1];
+          if (!svc || !SERVICES[svc]) {
+            ctx.ui.notify(`Available: ${Object.keys(SERVICES).join(", ")}`, "error"); return;
+          }
+          if (!existsSync("docker-compose.yml")) {
+            ctx.ui.notify("No docker-compose.yml. Run /stack init first.", "error"); return;
+          }
+          const content = readFileSync("docker-compose.yml", "utf-8");
+          if (content.includes(`  ${svc}:`)) {
+            ctx.ui.notify(`${svc} already in compose`, "info"); return;
+          }
+          // Append service before volumes section
+          const volIdx = content.indexOf("\nvolumes:");
+          const newYaml = volIdx >= 0
+            ? content.slice(0, volIdx) + "\n" + SERVICES[svc].yaml + "\n" + content.slice(volIdx)
+            : content + "\n" + SERVICES[svc].yaml;
+          // Add volumes
+          const newVols = SERVICES[svc].volumes.filter(v => !content.includes(`  ${v}:`));
+          let final = newYaml;
+          if (newVols.length > 0) {
+            final += newVols.map(v => `\n  ${v}:`).join("");
+          }
+          writeFileSync("docker-compose.yml", final);
+          ctx.ui.notify(`${GREEN}✓${RST} Added ${B}${svc}${RST} to docker-compose.yml`, "info");
+          break;
+        }
+
+        case "up": {
+          if (!existsSync("docker-compose.yml")) { ctx.ui.notify("No docker-compose.yml", "error"); return; }
+          try {
+            const out = execSync("docker compose up -d", { encoding: "utf-8", timeout: 60000 });
+            ctx.ui.notify(`${GREEN}✓${RST} Stack started\n${D}${out}${RST}`, "info");
+          } catch (e: any) { ctx.ui.notify(`${RED}Failed:${RST} ${e.message}`, "error"); }
+          break;
+        }
+
+        case "down": {
+          try {
+            const out = execSync("docker compose down", { encoding: "utf-8", timeout: 30000 });
+            ctx.ui.notify(`${GREEN}✓${RST} Stack stopped\n${D}${out}${RST}`, "info");
+          } catch (e: any) { ctx.ui.notify(`${RED}Failed:${RST} ${e.message}`, "error"); }
+          break;
+        }
+
+        case "status": case "ps": {
+          try {
+            const out = execSync("docker compose ps", { encoding: "utf-8", timeout: 10000 });
+            ctx.ui.notify(`${B}${CYAN}Stack Status${RST}\n${out}`, "info");
+          } catch (e: any) { ctx.ui.notify(`${RED}Failed:${RST} ${e.message}`, "error"); }
+          break;
+        }
+
+        case "env": {
+          if (!existsSync("docker-compose.yml")) { ctx.ui.notify("No docker-compose.yml", "error"); return; }
+          const content = readFileSync("docker-compose.yml", "utf-8");
+          const svcs = Object.keys(SERVICES).filter(s => content.includes(`  ${s}:`) || content.includes(`  ${s}-`));
+          writeFileSync(".env.example", generateEnv(svcs));
+          ctx.ui.notify(`${GREEN}✓${RST} Regenerated .env.example`, "info");
+          break;
+        }
+
+        default: {
+          ctx.ui.notify([
+            `${B}${CYAN}🐳 Stack — Local AI Infrastructure${RST}`,
+            "",
+            `  /stack init [preset]  — generate docker-compose.yml`,
+            `    Presets: minimal (Ollama), standard (Ollama+n8n+Supabase), full (+Flowise+Neo4j+SearXNG)`,
+            `  /stack add <service>  — add service (${Object.keys(SERVICES).length} available)`,
+            `  /stack up             — docker compose up -d`,
+            `  /stack down           — docker compose down`,
+            `  /stack status         — check running services`,
+            `  /stack env            — regenerate .env secrets`,
+            "",
+            `  ${D}Services: ${Object.keys(SERVICES).join(", ")}${RST}`,
+          ].join("\n"), "info");
+        }
+      }
+    },
+  });
+
+  pi.registerTool("stack_init", {
+    description: "Generate docker-compose.yml for local AI infrastructure",
+    parameters: Type.Object({
+      services: Type.Array(Type.String({ description: "Services: ollama, n8n, supabase, flowise, neo4j, searxng, qdrant, langfuse, openwebui, postgres, redis" })),
+      outputPath: Type.Optional(Type.String({ description: "Output directory (default: cwd)" })),
+    }),
+    execute: async (p) => {
+      const dir = p.outputPath ? resolve(p.outputPath) : process.cwd();
+      writeFileSync(join(dir, "docker-compose.yml"), generateCompose(p.services));
+      writeFileSync(join(dir, ".env.example"), generateEnv(p.services));
+      return { services: p.services, composePath: join(dir, "docker-compose.yml") };
+    },
+  });
+}
