@@ -1,0 +1,31 @@
+{
+  "name": "@artale/pi-stack",
+  "version": "1.0.0",
+  "description": "Docker Compose configuration generator for local AI infrastructure stacks",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "pi",
+    "docker",
+    "docker-compose",
+    "ai",
+    "infrastructure",
+    "ollama",
+    "n8n",
+    "supabase"
+  ],
+  "author": "Artale",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arosstale/pi-stack.git"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
